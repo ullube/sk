@@ -21,7 +21,7 @@ from aiogram.types import BotCommand
 async def set_bot_commands(bot: Bot):
     """Chap menyu commandalar"""
     commands = [
-        BotCommand(command="start", description="🏠 메인 메뉴"),
+        BotCommand(command="mytable", description="📊 내 근무표"),
         BotCommand(command="info", description="👤 프로필"),
         BotCommand(command="monthly", description="📅 월별 전체 보기")
     ]

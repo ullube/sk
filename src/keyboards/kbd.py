@@ -342,3 +342,45 @@ def back_to_main_inline():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="⬅️ 메인으로", callback_data="main_menu"))
     return builder.as_markup()
+
+# ===================== YANGI: 월별 전체 보기 + 캘린더 (yil/oy tanlash) =====================
+
+# 월별 전체 보기 xabari ostidagi tugmalar
+def monthly_summary_inline(workplace_id):
+    builder = InlineKeyboardBuilder()
+    year = datetime.now().year
+    builder.row(InlineKeyboardButton(text="📅 캘린더", callback_data=f"mcal_{workplace_id}_{year}"))
+    builder.row(InlineKeyboardButton(text="⬅️ 메인으로", callback_data="main_menu"))
+    return builder.as_markup()
+
+# Tanlangan yilning 12 oyi (◀️ yil ▶️)
+def year_months_inline(workplace_id, year):
+    builder = InlineKeyboardBuilder()
+    now = datetime.now()
+
+    # Yil almashtirish qatori
+    builder.row(
+        InlineKeyboardButton(text="◀️", callback_data=f"mcal_{workplace_id}_{year - 1}"),
+        InlineKeyboardButton(text=f"{year}년", callback_data="ignore"),
+        InlineKeyboardButton(text="▶️", callback_data=f"mcal_{workplace_id}_{year + 1}")
+    )
+
+    # 12 ta oy (3 tadan 4 qator)
+    for m in range(1, 13):
+        if year == now.year and m == now.month:
+            text = f"📍{m}월"
+        else:
+            text = f"{m}월"
+        builder.button(text=text, callback_data=f"mrep_{workplace_id}_{year}_{m}")
+    builder.adjust(3, 3, 3, 3, 3)
+
+    builder.row(InlineKeyboardButton(text="⬅️ 뒤로", callback_data=f"monthly_wp_{workplace_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ 메인으로", callback_data="main_menu"))
+    return builder.as_markup()
+
+# Oy hisoboti ostidagi tugmalar (oylarga qaytish)
+def month_report_back_inline(workplace_id, year):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📅 다른 월 선택", callback_data=f"mcal_{workplace_id}_{year}"))
+    builder.row(InlineKeyboardButton(text="⬅️ 메인으로", callback_data="main_menu"))
+    return builder.as_markup()

@@ -10,6 +10,7 @@ from src.utils.state_filters import is_free_text
 from aiogram.types import BufferedInputFile
 from src.utils.image_generator import create_calendar_image
 import asyncio
+import aiosqlite
 
 router = Router()
 
@@ -38,6 +39,61 @@ async def delete_message_after(bot, chat_id, message_id, seconds):
     except Exception:
         pass
 
+# ===== YANGI: Umumiy yordamchi - berilgan oy uchun kalendar rasmini yaratish =====
+async def build_month_report_image(user_id, workplace_id, year, month, first_name=None, last_name=None):
+    """Berilgan oy uchun hisobot rasmini qaytaradi.
+    Eski yozuvlar workplace_id dan qat'i nazar bazadan to'liq olinadi (user_id + sana bo'yicha).
+    Hali kelmagan oylar uchun yozuvi yo'q kunlar haftalik jadval bo'yicha hisoblanadi."""
+    workplace_name = await db.get_workplace_name(workplace_id)
+
+    # O'ZGARDI: workplace_id bo'yicha filtr olib tashlandi
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT work_date, hours, note FROM work_logs "
+            "WHERE user_id = ? AND work_date LIKE ? ORDER BY work_date",
+            (user_id, f"{year}-{month:02d}%")
+        ) as cursor:
+            logs = await cursor.fetchall()
+
+    work_dict = {log[0]: (log[1] or 0) for log in logs}
+    notes_dict = {log[0]: log[2] for log in logs if len(log) > 2 and log[2]}
+
+    # Kelajakdagi oylar uchun jadval bo'yicha avtomatik hisob (bazaga yozilmaydi)
+    now = datetime.now()
+    if (year, month) > (now.year, now.month):
+        schedule = await db.get_user_schedule(user_id)
+        if schedule:
+            days_in_month = calendar.monthrange(year, month)[1]
+            for day in range(1, days_in_month + 1):
+                date_obj = datetime(year, month, day)
+                date_key = date_obj.strftime("%Y-%m-%d")
+                if date_key in work_dict:
+                    continue  # qo'lda kiritilgan yozuv ustun turadi
+                day_name = db.WEEKDAY_NAMES[date_obj.weekday()]
+                work_dict[date_key] = schedule.get(day_name, 0)
+
+    hourly_rate, tax_rate = await db.get_user_settings(user_id)
+    total_hours = sum([h for h in work_dict.values() if h > 0])
+    gross = total_hours * hourly_rate
+    tax = gross * (tax_rate / 100)
+    net = gross - tax
+
+    image = await create_calendar_image(
+        workplace_name, month, year,
+        work_dict, total_hours, gross, tax, net,
+        hourly_rate, tax_rate,
+        first_name=first_name,
+        last_name=last_name,
+        notes_dict=notes_dict
+    )
+
+    photo = BufferedInputFile(image.read(), filename="calendar.png")
+    return photo, workplace_name
+# ===== YANGI: ishxona shu foydalanuvchiga tegishlimi =====
+async def user_owns_workplace(user_id, workplace_id) -> bool:
+    workplaces = await db.get_user_workplaces(user_id)
+    return any(wp[0] == workplace_id for wp in workplaces)
+
 # /start command
 @router.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
@@ -57,6 +113,54 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         "원하시는 메뉴를 선택해주세요:",
         reply_markup=kbd.main_menu_inline()
+    )
+
+# ===== YANGI: /mytable - chap menyudagi "📊 내 근무표" tugmasi (bitta bosishda to'g'ridan-to'g'ri ochiladi) =====
+@router.message(F.text == "/mytable")
+async def cmd_my_table(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    await state.clear()
+
+    await db.update_user_info(
+        user_id,
+        message.from_user.full_name,
+        message.from_user.username
+    )
+
+    if not await db.is_user_active(user_id):
+        await message.answer("🚫 차단된 사용자입니다.\n관리자에게 문의하세요.")
+        return
+
+    workplaces = await db.get_user_workplaces(user_id)
+
+    if not workplaces:
+        await message.answer(
+            "🏢 직장이 없습니다.\n먼저 직장을 추가하세요:",
+            reply_markup=kbd.add_workplace_only_inline()
+        )
+        return
+
+    # Bitta ishxona bo'lsa - to'g'ridan-to'g'ri jadval rasmi
+    if len(workplaces) == 1:
+        workplace_id = workplaces[0][0]
+        now = datetime.now()
+        photo, workplace_name = await build_month_report_image(
+            user_id, workplace_id, now.year, now.month,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name
+        )
+        sent_message = await message.answer_photo(
+            photo=photo,
+            caption=f"🏢 {workplace_name}\n📅 {now.year}년 {now.month}월 근무표",
+            reply_markup=kbd.workplace_actions_inline(workplace_id)
+        )
+        # 1 daqiqadan keyin rasmni o'chirish
+        asyncio.create_task(delete_message_after(message.bot, sent_message.chat.id, sent_message.message_id, 60))
+        return
+
+    await message.answer(
+        "🏢 직장을 선택하세요:",
+        reply_markup=kbd.workplaces_list_inline(workplaces)
     )
 
 # Asosiy menyuga qaytish
@@ -107,31 +211,15 @@ async def show_workplace_report(callback: CallbackQuery, workplace_id: int = Non
         workplace_id = int(callback.data.split("_")[-1])
     user_id = callback.from_user.id
 
-    workplace_name = await db.get_workplace_name(workplace_id)
-
     now = datetime.now()
     year = now.year
     month = now.month
 
-    logs = await db.get_monthly_logs_by_workplace(user_id, workplace_id, year, month)
-    # logs: [(work_date, hours, note), ...]
-    work_dict = {log[0]: log[1] for log in logs}
-    notes_dict = {log[0]: log[2] for log in logs if len(log) > 2 and log[2]}
-
-    hourly_rate, tax_rate = await db.get_user_settings(user_id)
-    total_hours = sum([log[1] for log in logs if log[1] > 0])
-    gross = total_hours * hourly_rate
-    tax = gross * (tax_rate / 100)
-    net = gross - tax
-
     # Rasm yaratish (eslatmalar bilan birga)
-    image = await create_calendar_image(
-        workplace_name, month, year, 
-        work_dict, total_hours, gross, tax, net,
-        hourly_rate, tax_rate,
+    photo, workplace_name = await build_month_report_image(
+        user_id, workplace_id, year, month,
         first_name=callback.from_user.first_name,
-        last_name=callback.from_user.last_name,
-        notes_dict=notes_dict
+        last_name=callback.from_user.last_name
     )
 
     # Eski xabarni o'chirish
@@ -142,7 +230,7 @@ async def show_workplace_report(callback: CallbackQuery, workplace_id: int = Non
 
     # Rasmni yuborish
     sent_message = await callback.message.answer_photo(
-        photo=BufferedInputFile(image.read(), filename="calendar.png"),
+        photo=photo,
         caption=f"🏢 {workplace_name}\n📅 {year}년 {month}월 근무표",
         reply_markup=kbd.workplace_actions_inline(workplace_id)
     )
@@ -270,14 +358,26 @@ async def show_full_monthly_summary(callback: CallbackQuery, workplace_id: int):
     """Barcha oylarning umumiy hisobotini bitta chiroyli matnli xabarda ko'rsatish"""
     user_id = callback.from_user.id
     text = await build_full_monthly_text(user_id, workplace_id)
-    await safe_edit_or_answer(callback, text, reply_markup=kbd.back_to_main_inline())
+    # YANGI: 📅 캘린더 tugmasi bilan
+    await safe_edit_or_answer(callback, text, reply_markup=kbd.monthly_summary_inline(workplace_id))
 
 async def build_full_monthly_text(user_id: int, workplace_id: int) -> str:
-    """Berilgan ishxona bo'yicha barcha oylar hisobotini matn shaklida qaytaradi"""
+    """Bazadagi barcha oylar hisoboti (workplace_id dan qat'i nazar, user_id bo'yicha)"""
     workplace_name = await db.get_workplace_name(workplace_id)
     hourly_rate, tax_rate = await db.get_user_settings(user_id)
 
-    summaries = await db.get_all_monthly_summaries(user_id, workplace_id)
+    # O'ZGARDI: workplace_id bo'yicha filtr olib tashlandi
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        async with conn.execute("""
+            SELECT substr(work_date, 1, 7) as ym,
+                   SUM(CASE WHEN hours > 0 THEN hours ELSE 0 END) as total_hours,
+                   SUM(CASE WHEN hours > 0 THEN 1 ELSE 0 END) as work_days_count
+            FROM work_logs
+            WHERE user_id = ?
+            GROUP BY ym
+            ORDER BY ym DESC
+        """, (user_id,)) as cursor:
+            summaries = await cursor.fetchall()
 
     if not summaries:
         return f"🏢 {workplace_name}\n\n📭 근무 기록이 없습니다."
@@ -326,7 +426,69 @@ async def monthly_overview_command(message: Message, state: FSMContext):
 
     if len(workplaces) == 1:
         text = await build_full_monthly_text(user_id, workplaces[0][0])
-        await message.answer(text, reply_markup=kbd.back_to_main_inline())
+        # YANGI: 📅 캘린더 tugmasi bilan
+        await message.answer(text, reply_markup=kbd.monthly_summary_inline(workplaces[0][0]))
         return
 
     await message.answer("🏢 직장을 선택하세요:", reply_markup=kbd.workplaces_for_monthly_inline(workplaces))
+
+# ===================== YANGI: 📅 캘린더 - yil tanlash va istalgan oyni ko'rish =====================
+
+# Tanlangan yilning 12 oyini ko'rsatish
+@router.callback_query(F.data.startswith("mcal_"))
+async def show_year_months(callback: CallbackQuery):
+    await callback.answer()
+    parts = callback.data.split("_")
+    workplace_id = int(parts[1])
+    year = int(parts[2])
+    user_id = callback.from_user.id
+
+    # Yil oralig'ini cheklaymiz (xato sana chiqmasligi uchun)
+    if year < 2000 or year > 2100:
+        return
+
+    if not await user_owns_workplace(user_id, workplace_id):
+        return
+
+    workplace_name = await db.get_workplace_name(workplace_id)
+
+    await safe_edit_or_answer(
+        callback,
+        f"🏢 {workplace_name}\n📅 {year}년\n\n확인할 월을 선택하세요:",
+        reply_markup=kbd.year_months_inline(workplace_id, year)
+    )
+
+# Tanlangan oyning to'liq hisoboti (rasm: soat, oylik, soliq, memo)
+@router.callback_query(F.data.startswith("mrep_"))
+async def show_selected_month_report(callback: CallbackQuery):
+    await callback.answer()
+    parts = callback.data.split("_")
+    workplace_id = int(parts[1])
+    year = int(parts[2])
+    month = int(parts[3])
+    user_id = callback.from_user.id
+
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        return
+
+    if not await user_owns_workplace(user_id, workplace_id):
+        return
+
+    photo, workplace_name = await build_month_report_image(
+        user_id, workplace_id, year, month,
+        first_name=callback.from_user.first_name,
+        last_name=callback.from_user.last_name
+    )
+
+    # Eski xabarni o'chirish
+    try:
+        await callback.message.delete()
+    except:
+        pass
+
+    # Bu yerda rasm avtomatik o'chirilmaydi - foydalanuvchi oylar orasida erkin yuradi
+    await callback.message.answer_photo(
+        photo=photo,
+        caption=f"🏢 {workplace_name}\n📅 {year}년 {month}월 근무표",
+        reply_markup=kbd.month_report_back_inline(workplace_id, year)
+    )
